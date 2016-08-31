@@ -583,7 +583,7 @@ struct Object *memory_region_owner(MemoryRegion *mr);
  *
  * @mr: the memory region being queried.
  */
-uint64_t memory_region_size(MemoryRegion *mr);
+uint64_t memory_region_size(const MemoryRegion *mr);
 
 /**
  * memory_region_is_ram: check whether a memory region is random access
@@ -1251,7 +1251,10 @@ void memory_global_dirty_log_start(void);
  */
 void memory_global_dirty_log_stop(void);
 
-void mtree_info(fprintf_function mon_printf, void *f);
+/**
+ * mtree_info: see hmp-commands-info.hx item info mtree
+ */
+void mtree_info(fprintf_function mon_printf, void *f, const int mapinfo_width);
 
 /**
  * memory_region_dispatch_read: perform a read directly to the specified

@@ -1529,7 +1529,9 @@ static void hmp_boot_set(Monitor *mon, const QDict *qdict)
 
 static void hmp_info_mtree(Monitor *mon, const QDict *qdict)
 {
-    mtree_info((fprintf_function)monitor_printf, mon);
+    int mapinfo_width = qdict_get_try_int(qdict, "mapinfo-width", -1);
+
+    mtree_info((fprintf_function)monitor_printf, mon, mapinfo_width);
 }
 
 static void hmp_info_numa(Monitor *mon, const QDict *qdict)
