@@ -595,7 +595,7 @@ static MemTxResult access_with_adjusted_size(hwaddr addr,
     return r;
 }
 
-static AddressSpace *memory_region_to_address_space(MemoryRegion *mr)
+static AddressSpace *memory_region_to_address_space(const MemoryRegion *mr)
 {
     AddressSpace *as;
 
@@ -1472,7 +1472,7 @@ void memory_region_unref(MemoryRegion *mr)
     }
 }
 
-uint64_t memory_region_size(MemoryRegion *mr)
+uint64_t memory_region_size(const MemoryRegion *mr)
 {
     if (int128_eq(mr->size, int128_2_64())) {
         return UINT64_MAX;
@@ -2039,11 +2039,11 @@ bool memory_region_is_mapped(MemoryRegion *mr)
 /* Same as memory_region_find, but it does not add a reference to the
  * returned region.  It must be called from an RCU critical section.
  */
-static MemoryRegionSection memory_region_find_rcu(MemoryRegion *mr,
+static MemoryRegionSection memory_region_find_rcu(const MemoryRegion *mr,
                                                   hwaddr addr, uint64_t size)
 {
     MemoryRegionSection ret = { .mr = NULL };
-    MemoryRegion *root;
+    const MemoryRegion *root;
     AddressSpace *as;
     AddrRange range;
     FlatView *view;
@@ -2301,10 +2301,173 @@ struct MemoryRegionList {
 
 typedef QTAILQ_HEAD(queue, MemoryRegionList) MemoryRegionListHead;
 
+static char mtree_mr_sample_reftype_marker(const MemoryRegion *mr,
+                                           const MemoryRegion *mv,
+                                           const MemoryRegion *mc,
+                                           const hwaddr offset,
+                                           const int max_chainlen)
+{
+    const MemoryRegion *al = mc->alias;
+    const MemoryRegion *submr;
+    char marker, hint = 0;
+
+    if (int128_ge(int128_make64(offset), mc->size)) {
+        return 0;
+    }
+    if (max_chainlen < 0) {
+        /* this is most probably a complex alias loop situation */
+        return 'E'; /* max. link chain length exceeded */
+    }
+
+    if (al) {
+        if (al == mv) {
+            if (mr->enabled) {
+                if (mc == mr) {
+                    return '@'; /* indirect link found */
+                } else {
+                    return 'a'; /* 2nd degree related alias */
+                }
+            } else {
+                return '~';
+            }
+        }
+        if (al == mr) {
+            return 'L'; /* alias loop */
+        }
+        if (al == mc) {
+            return 'X'; /* alias self reference */
+        }
+        if (al->alias == mc) {
+            return 'M'; /* mutual alias */
+        }
+        if ((al->enabled) &&
+            (int128_lt(int128_add(int128_make64(offset),
+                                  int128_make64(mc->alias_offset)),
+                       al->size))) {
+            marker = mtree_mr_sample_reftype_marker(mr, mv, al,
+                                                    offset + mc->alias_offset,
+                                                    max_chainlen - 1);
+            if (marker && marker != 'E') {
+                return marker;
+            }
+            hint |= marker; /* propagate 'E' dominantly over 0 */
+        }
+    }
+
+    QTAILQ_FOREACH(submr, &mc->subregions, subregions_link) {
+        if (submr == mv) {
+            if (mr->enabled) {
+                if (mc == mr) {
+                    return 's'; /* occluded by subregion */
+                } else {
+                    return 'c'; /* 2nd degree related child */
+                }
+            } else {
+                return '.';
+            }
+        }
+        if ((submr->enabled) && (offset >= submr->addr)) {
+            marker = mtree_mr_sample_reftype_marker(mr, mv, submr,
+                                                    offset - submr->addr,
+                                                    max_chainlen - 1);
+            if (marker && marker != 'E') {
+                return marker;
+            }
+            hint |= marker; /* propagate 'E' dominantly over 0 */
+        }
+    }
+
+    return hint; /* either 0 or 'E' */
+}
+
+/* Depict memory region subrange structure,
+ * i.e. occlusion by submaps respectively visibility of submaps
+ * as supposedly resulting from region priorisation rules.
+ */
+static void mtree_print_mr_v_samples(fprintf_function mon_printf,
+                                     void *f,
+                                     const MemoryRegion *mr,
+                                     const unsigned int columns)
+{
+    const MemoryRegion *mv;
+    unsigned int i, j;
+    hwaddr size, offset;
+    bool covered = false;
+
+    /* prevent uncovered corner cases and excessive sampling effort */
+    if ((columns < 2) || (columns > 1000)) {
+        if (columns) {
+            mon_printf(f, "[%s: not supporting %d column(s)]",
+                       __func__, columns);
+        }
+        return;
+    }
+
+    /* convert/constrain mr->size to hwaddr bit size */
+    size = memory_region_size(mr);
+    if (!size) {
+        /* size is 0 for example with 'dummy' regions in VFIO */
+        mon_printf(f, "%*s", columns, "");
+        return;
+    }
+
+    i = columns;
+    j = size / (i - 1); /* step ('slice') width */
+    if (j < 1) {
+        j = 1;
+    }
+    offset = 0; /* sample position within region */
+    while (i--) {
+        if (offset >= (size - 1)) {
+            /* region might have less bytes than columns were requested */
+            if (covered) {
+                mon_printf(f, " "); /* no more additional samples */
+                continue;
+            }
+            covered = true;
+            offset = size - 1;
+        }
+        rcu_read_lock();
+        mv = memory_region_find_rcu(mr, offset, 1).mr;
+        rcu_read_unlock();
+        if (mv == mr) {
+            if (mr->enabled) {
+                /* mr is directly visible at the sample addr */
+                mon_printf(f, "+");
+            } else {
+                mon_printf(f, "-");
+            }
+        } else {
+            /* mr is not visible, but mv is visible unless NULL */
+            if (!mv) {
+                mon_printf(f, "/"); /* nothing mapped at the sample addr */
+            } else {
+                /* mr is occluded by mv which supposedly is
+                 * either linked via an alias/subregion construct
+                 *     or a higher prioritized subregion of the same parent
+                 */
+                char marker;
+
+                /* current memory region hierarchy depth is close to 5,
+                 * so a maximum search depth of 20 should be sufficient;
+                 * i.e. a link chain length longer than 20 is considered a loop
+                 */
+                marker = mtree_mr_sample_reftype_marker(mr, mv, mr, offset, 20);
+                if (!marker) {
+                    marker = 'o'; /* occlusion by sibling or unrelated region */
+                }
+                mon_printf(f, "%c", marker);
+            }
+        }
+        offset += j;
+    }
+}
+
 static void mtree_print_mr(fprintf_function mon_printf, void *f,
                            const MemoryRegion *mr, unsigned int level,
                            hwaddr base,
-                           MemoryRegionListHead *alias_print_queue)
+                           MemoryRegionListHead *alias_print_queue,
+                           const unsigned int mr_visibility_samples)
 {
     MemoryRegionList *new_ml, *ml, *next_ml;
     MemoryRegionListHead submr_print_queue;
@@ -2313,6 +2476,12 @@ static void mtree_print_mr(fprintf_function mon_printf, void *f,
 
     if (!mr) {
         return;
+    }
+
+    if (mr_visibility_samples) {
+        /* on the very left depict region occlusion/visibility */
+        mtree_print_mr_v_samples(mon_printf, f,
+                                 mr, mr_visibility_samples);
     }
 
     for (i = 0; i < level; i++) {
@@ -2392,7 +2561,7 @@ static void mtree_print_mr(fprintf_function mon_printf, void *f,
 
     QTAILQ_FOREACH(ml, &submr_print_queue, queue) {
         mtree_print_mr(mon_printf, f, ml->mr, level + 1, base + mr->addr,
-                       alias_print_queue);
+                       alias_print_queue, mr_visibility_samples);
     }
 
     QTAILQ_FOREACH_SAFE(ml, &submr_print_queue, queue, next_ml) {
@@ -2400,24 +2569,87 @@ static void mtree_print_mr(fprintf_function mon_printf, void *f,
     }
 }
 
-void mtree_info(fprintf_function mon_printf, void *f)
+static int sane_mtree_info_mapinfo_width(const int requested_width)
+{
+    static int default_width = -1;
+
+    int width = requested_width;
+
+    /* (on first call) establish a default for the number of region samples */
+    if (default_width < 0) {
+        char *str = getenv("QEMU_INFO_MTREE_MAPINFO_WIDTH");
+
+        if (str) {
+            default_width = atoi(str);
+        } else {
+            default_width = 0;
+        }
+        if (default_width < 0) {
+            /* prevent repeating getenv -
+             * fallback to sampling over 8 'slices'
+             */
+            default_width = 9;
+        }
+    }
+
+    /* use the default when the requested width is negative */
+    if (width < 0) {
+        width = default_width;
+    }
+
+    /* and finally adapt to 'usability' constraints */
+    if (width < 5) {
+        /* sampling over very few 'slices' creates too much
+         * corner case complexity and is also not much of use
+         */
+        width = 0; /* disable the sample display completely */
+    }
+    if (width > 0x101) {
+        /* limit the output prefix width to some (un-)reasonable value:
+         * max 2^8+1 samples subdividing a region into 2^8 'slices'
+         */
+        width = 0x101;
+    }
+
+    return width;
+}
+
+void mtree_info(fprintf_function mon_printf, void *f, const int mapinfo_width)
 {
     MemoryRegionListHead ml_head;
     MemoryRegionList *ml, *ml2;
     AddressSpace *as;
+    int mr_visibility_samples = sane_mtree_info_mapinfo_width(mapinfo_width);
+
+    if (mr_visibility_samples) {
+        /* print a symbolisation cross reference */
+        mon_printf(f, "\n");
+        mon_printf(f, "/: nothing mapped at sample address\n");
+        mon_printf(f, "+: region directly mapped at sample\n");
+        mon_printf(f, "@: alias region mapped at sample\n");
+        mon_printf(f, "~: alias region mappable but disabled at sample\n");
+        mon_printf(f, "s: region occluded by subregion at sample\n");
+        mon_printf(f, "a: region occluded by an aliased subregion at sample\n");
+        mon_printf(f, "c: region occluded by a child "
+                          "(subregion) of an alias at sample\n");
+        mon_printf(f, "o: region occluded by some other region at sample\n");
+        mon_printf(f, "\n");
+    }
 
     QTAILQ_INIT(&ml_head);
 
     QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
         mon_printf(f, "address-space: %s\n", as->name);
-        mtree_print_mr(mon_printf, f, as->root, 1, 0, &ml_head);
+        mtree_print_mr(mon_printf, f, as->root, 1, 0, &ml_head,
+                       mr_visibility_samples);
         mon_printf(f, "\n");
     }
 
     /* print aliased regions */
     QTAILQ_FOREACH(ml, &ml_head, queue) {
         mon_printf(f, "memory-region: %s\n", memory_region_name(ml->mr));
-        mtree_print_mr(mon_printf, f, ml->mr, 1, 0, &ml_head);
+        mtree_print_mr(mon_printf, f, ml->mr, 1, 0, &ml_head,
+                       mr_visibility_samples);
         mon_printf(f, "\n");
     }
 

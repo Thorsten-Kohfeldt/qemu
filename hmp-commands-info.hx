@@ -264,16 +264,17 @@ ETEXI
 
     {
         .name       = "mtree",
-        .args_type  = "",
-        .params     = "",
-        .help       = "show memory tree",
+        .args_type  = "mapinfo-width:l?",
+        .params     = "[mapinfo-width]",
+        .help       = "show memory tree "
+                      "(mapinfo-width: depict memory subregion mappings with leading characters)",
         .mhandler.cmd = hmp_info_mtree,
     },
 
 STEXI
 @item info mtree
 @findex mtree
-Show memory tree.
+Show memory tree optionally depicting subregion mappings.
 ETEXI
 
     {
