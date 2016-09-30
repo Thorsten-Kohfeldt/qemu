@@ -825,6 +825,46 @@ static void vfio_probe_nvidia_bar0_quirk(VFIOPCIDevice *vdev, int nr)
  * vfio: vfio_bar_write(0000:05:00.0:BAR2+0x74, 0x8001f000, 4) // do write
  * vfio: vfio_bar_read(0000:05:00.0:BAR2+0x74, 4) = 0x1f000 // complete
  */
+
+/*
+ * NOTE that this quirk is currently not required for Linux guests,
+ *           as the Linux driver currently does not employ MSI-X mode.
+ * If you find your RTL8168 device behave broken, you can try forcing
+ * its sub device id to this value in order to disable this quirk,
+ * in which case your RTL8168 might start working under Linux again.
+ *
+ * ALSO NOTE that this has potential to speed up BAR2 operations,
+ *                as it re-enables BAR2 mmap mode,
+ *                but it leaves above described backdoor to the host
+ *                MSI-X table open for the guest to access though.
+ *
+ * FURTHER NOTE that if your RTL8168 is of an early revision, then
+ *                   it might not even have that backdoor in which
+ *                   case the quirk should also be disabled by
+ *                   forcing the sub device id to this value.
+ */
+#define PCI_SUB_DEVICE_ID_RTL8168_SKIP_QUIRK 0x5c1b
+/*
+ * If the guest driver is sub device id sensistive, then force the
+ * sub vendor id instead - any match will do.
+ */
+#define PCI_SUB_VENDOR_ID_RTL8168_SKIP_QUIRK 0x5c1b
+
+/*
+ * The following id provides an alternative preferable to just skipping the
+ * quirk in case your RTL8168 device has the backdoor and behaves broken.
+ * When the card's sub device id is forced to this value, the quirk
+ * is modified by adding an additional memory region which potentially
+ * hides a sub-page mmap management bug which might be the reason
+ * for the card freezing during loading of its firmware.
+ */
+#define PCI_SUB_DEVICE_ID_RTL8168_MOD_QUIRK 0xa1de
+/*
+ * If the guest driver is sub device id sensistive, then force the
+ * sub vendor id instead - any match will do.
+ */
+#define PCI_SUB_VENDOR_ID_RTL8168_MOD_QUIRK 0xa1de
+
 typedef struct VFIOrtl8168Quirk {
     VFIOPCIDevice *vdev;
     uint32_t addr;
@@ -936,7 +976,9 @@ static void vfio_probe_rtl8168_bar2_quirk(VFIOPCIDevice *vdev, int nr)
     VFIOrtl8168Quirk *rtl;
     int q_mr_prio;
 
-    if (!vfio_pci_is(vdev, PCI_VENDOR_ID_REALTEK, 0x8168) || nr != 2) {
+    if (!vfio_pci_is(vdev, PCI_VENDOR_ID_REALTEK, 0x8168) || nr != 2 ||
+        vdev->sub_vendor_id == PCI_SUB_VENDOR_ID_RTL8168_SKIP_QUIRK ||
+        vdev->sub_device_id == PCI_SUB_DEVICE_ID_RTL8168_SKIP_QUIRK) {
         return;
     }
     region = &vdev->bars[nr].region;
@@ -944,6 +986,12 @@ static void vfio_probe_rtl8168_bar2_quirk(VFIOPCIDevice *vdev, int nr)
     quirk = g_malloc0(sizeof(*quirk));
     quirk->nr_mem = 2;
     q_mr_prio = 1;
+    if (vdev->sub_vendor_id == PCI_SUB_VENDOR_ID_RTL8168_MOD_QUIRK ||
+        vdev->sub_device_id == PCI_SUB_DEVICE_ID_RTL8168_MOD_QUIRK) {
+        /* support one more max. page sized mr directly 'below' the quirk */
+        quirk->nr_mem += 1;
+        q_mr_prio += 1; /* make room for its intermediate priority */
+    }
     quirk->mem = g_new0(MemoryRegion, quirk->nr_mem);
     quirk->data = rtl = g_malloc0(sizeof(*rtl));
     rtl->vdev = vdev;
@@ -960,6 +1008,30 @@ static void vfio_probe_rtl8168_bar2_quirk(VFIOPCIDevice *vdev, int nr)
     memory_region_add_subregion_overlap(region->mem, 0x70, &quirk->mem[1],
                                         q_mr_prio);
 
+    if (quirk->nr_mem > 2) {
+        uint64_t mr_size = region->size;
+
+        if (mr_size > TARGET_PAGE_SIZE) {
+            /*
+             * This subregion is used to make sure a slow path via
+             * vfio_region_ops is established for that mmio page which is
+             * 'disturbed' by this quirk and thus *would be* skipped for
+             * mmap 'activation' in common.c/vfio_listener_region_add()
+             * (*if* the mmap-prepared region was exposed instead).
+             * This region is placed priority-wise between the mmap-
+             * prepared region and the quirk and thus has precedence
+             * over the mmap-skip-prone region.
+             * This 'helper' region does not need to be larger than the
+             * 'disturbed' page though.
+             */
+            mr_size = TARGET_PAGE_SIZE;
+        }
+        memory_region_init_io(&quirk->mem[2], OBJECT(vdev),
+                              &vfio_region_ops, region,
+                              "vfio-rtl8168-window-quirk-base", mr_size);
+        memory_region_add_subregion_overlap(region->mem, 0, &quirk->mem[2],
+                                            q_mr_prio - 1);
+    }
     QLIST_INSERT_HEAD(&vdev->bars[nr].quirks, quirk, next);
 
     trace_vfio_quirk_rtl8168_probe(vdev->vbasedev.name);
