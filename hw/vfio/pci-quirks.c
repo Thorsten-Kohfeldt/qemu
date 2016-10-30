@@ -875,8 +875,31 @@ static void vfio_rtl8168_quirk_address_write(void *opaque, hwaddr addr,
                                              offset, val, size,
                                              MEMTXATTRS_UNSPECIFIED);
             }
-            return; /* Do not write guest MSI-X data to hardware */
+            /* Do not write guest MSI-X data to hardware,
+             * but proceed with exploit counter measures
+             * as follows.
+             */
         }
+        /* In order to prevent any malicious exploit of the
+         * real hw MSI-X table, data written to its
+         * read/write selection and offset address register
+         * is always forced here to the same value.
+         * One might feel that it would be even better to
+         * write nothing at all, but that would leave the
+         * register potentially uninitialised,
+         * i.e. potentially more exploitable.
+         * The data value 0x10005 is expected to enforce
+         * a 0-masked read of real MSI-X table offset 5,
+         * which is arguably one of the safest actions
+         * in face of any potential exploit attempt:
+         * If the result is not forcibly masked to 0 by
+         * the hardware anyway, it leaks at most the high
+         * order double word of the interrupt message
+         * address part of the second MSI-X table entry
+         * into the double word at address 0x70, which is
+         * not readable through the quirk anyway.
+         */
+        data = 0x10005;
     }
 
     vfio_region_write(&vdev->bars[2].region, addr + 0x74, data, size);
@@ -900,11 +923,14 @@ static uint64_t vfio_rtl8168_quirk_data_read(void *opaque,
     VFIOPCIDevice *vdev = rtl->vdev;
     uint64_t data = vfio_region_read(&vdev->bars[2].region, addr + 0x70, size);
 
-    if (rtl->enabled && (vdev->pdev.cap_present & QEMU_PCI_CAP_MSIX)) {
-        hwaddr offset = rtl->addr & 0xfff;
-        memory_region_dispatch_read(&vdev->pdev.msix_table_mmio, offset,
-                                    &data, size, MEMTXATTRS_UNSPECIFIED);
-        trace_vfio_quirk_rtl8168_msix_read(vdev->vbasedev.name, offset, data);
+    if (rtl->enabled) {
+        data = 0; /* prevent any potential leak of real hw MSI-X info */
+        if (vdev->pdev.cap_present & QEMU_PCI_CAP_MSIX) {
+            hwaddr offset = rtl->addr & 0xfff;
+            memory_region_dispatch_read(&vdev->pdev.msix_table_mmio, offset,
+                                        &data, size, MEMTXATTRS_UNSPECIFIED);
+            trace_vfio_quirk_rtl8168_msix_read(vdev->vbasedev.name, offset, data);
+        }
     }
 
     return data;
@@ -917,7 +943,19 @@ static void vfio_rtl8168_quirk_data_write(void *opaque, hwaddr addr,
     VFIOPCIDevice *vdev = rtl->vdev;
 
     rtl->data = (uint32_t)data;
-
+    if (rtl->enabled) {
+        /* In order to prevent any malicious exploit of the
+         * real hw MSI-X table, data written to that register
+         * is always forced here to the same value.
+         * One might feel that it would be even better to
+         * write nothing at all, but that would leave the
+         * register potentially uninitialised,
+         * i.e. potentially more exploitable.
+         * The data value could probably be an arbitrary one,
+         * so 0 is picked as the arguably most natural choice.
+         */
+        data = 0;
+    }
     vfio_region_write(&vdev->bars[2].region, addr + 0x70, data, size);
 }
 
